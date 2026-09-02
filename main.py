@@ -1,139 +1,179 @@
 import os
 import re
-from fastapi import FastAPI, HTTPException, Request, Query
+import httpx
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pyrogram import Client
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import MessageMediaDocument
 
-app = FastAPI(title="NLSbox Anime Streaming API (User Session)")
+# Identifiants Render
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+SESSION_STRING = os.environ.get("SESSION_STRING")
 
-# Autoriser les requêtes (Mobile, Web, Local)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="NLSbox Pro Engine")
 
-# Configuration depuis les variables d'environnement de Render
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
-
-# Initialisation du client Utilisateur Telegram avec Session String
-user_bot = Client(
-    "nlsbox_user",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    in_memory=True
-)
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 @app.on_event("startup")
-async def startup_event():
-    if not user_bot.is_connected:
-        await user_bot.start()
-        me = await user_bot.get_me()
-        print(f" Connecté avec succès au compte Telegram : {me.first_name} (@{me.username or me.id})")
+async def startup():
+    await client.start()
+    print(" Connecté à Telegram !")
 
-@app.get("/")
-def root():
+@app.on_event("shutdown")
+async def shutdown():
+    await client.disconnect()
+
+# --- FONCTION POUR RÉCUPÉRER L'AFFICHE ET LES INFOS OFFICIELLES ---
+async def fetch_anime_metadata(query: str):
+    """Récupère les infos officielles (affiche HD, résumé, note) depuis AniList"""
+    graphql_query = """
+    query ($search: String) {
+        Media (search: $search, type: ANIME) {
+            title {
+                romaji
+                english
+            }
+            coverImage {
+                extraLarge
+                large
+            }
+            bannerImage
+            description(asHtml: false)
+            averageScore
+            genres
+            episodes
+            status
+            seasonYear
+        }
+    }
+    """
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as http_client:
+            response = await http_client.post(
+                "https://graphql.anilist.co",
+                json={"query": graphql_query, "variables": {"search": query}}
+            )
+            if response.status_code == 200:
+                data = response.json().get("data", {}).get("Media", {})
+                if data:
+                    return {
+                        "title": data.get("title", {}).get("english") or data.get("title", {}).get("romaji") or query,
+                        "cover": data.get("coverImage", {}).get("extraLarge") or data.get("coverImage", {}).get("large"),
+                        "banner": data.get("bannerImage"),
+                        "synopsis": data.get("description", "Aucun résumé disponible."),
+                        "score": f"{data.get('averageScore', 'N/A')}%",
+                        "genres": data.get("genres", []),
+                        "total_episodes_official": data.get("episodes"),
+                        "year": data.get("seasonYear")
+                    }
+    except Exception:
+        pass
+    
+    # Valeurs de secours si AniList ne répond pas
     return {
-        "status": "En ligne",
-        "mode": "User Session String",
-        "message": "API de recherche et streaming Telegram opérationnelle !"
+        "title": query.capitalize(),
+        "cover": "https://via.placeholder.com/300x450.png?text=Anime",
+        "banner": None,
+        "synopsis": "Informations indisponibles.",
+        "score": "N/A",
+        "genres": [],
+        "total_episodes_official": None,
+        "year": None
     }
 
-@app.get("/catalog/{channel_id}")
-@app.get("/search/{channel_id}")
-async def search_channel(
-    channel_id: str,
-    q: str = Query(default="", description="Mot-clé de recherche"),
-    limit: int = Query(default=100, description="Nombre max d'épisodes à scanner")
-):
-    """
-    RECHERCHE PAR MOT-CLÉ :
-    Tapez un nom d'animé (ex: Jujutsu, One Piece, 01) et récupérez tous les fichiers vidéos correspondants.
-    """
-    clean = channel_id.strip().lstrip("@")
-    # Gère les ID numériques de canaux privés (-100xxxxxxx) ou les usernames publics
-    target = int(clean) if (clean.startswith("-100") or clean.isdigit() or clean.startswith("-")) else clean
+# --- STREAMING RAPIDE TELEGRAM ---
+async def iter_file_chunks(message):
+    async for chunk in client.iter_download(message.media, chunk_size=1024 * 512):
+        yield chunk
 
-    episodes = []
+@app.get("/")
+def home():
+    return {"status": "En ligne", "app": "NLSbox Backend Pro"}
+
+# --- ROUTE DE RECHERCHE INSTANTANÉE ---
+@app.get("/search")
+async def search_anime(
+    q: str = Query(..., description="Nom de l'anime recherché (ex: Solo Leveling, Naruto)"),
+    channel: str = Query(..., description="ID ou @username du canal Telegram")
+):
     try:
-        # Parcours l'historique du canal Telegram avec votre compte utilisateur
-        async for msg in user_bot.get_chat_history(target, limit=limit):
-            if msg.video or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video")):
-                media = msg.video or msg.document
-                file_name = getattr(media, "file_name", "") or f"video_{msg.id}.mp4"
-                caption = msg.caption or ""
+        target = int(channel) if channel.startswith("-") or channel.isdigit() else channel
+        
+        # 1. Récupération des infos officielles (affiche, résumé)
+        metadata = await fetch_anime_metadata(q)
+        
+        # 2. Recherche instantanée des épisodes dans Telegram (côté serveur)
+        episodes = []
+        async for msg in client.iter_messages(target, search=q, limit=100):
+            if msg.media and isinstance(msg.media, MessageMediaDocument):
+                file_name = "Episode.mp4"
+                doc = msg.media.document
                 
-                search_haystack = f"{file_name} {caption}".lower()
+                for attr in doc.attributes:
+                    if hasattr(attr, 'file_name') and attr.file_name:
+                        file_name = attr.file_name
                 
-                # Filtrage selon le mot-clé tapé par l'utilisateur
-                if not q or q.strip().lower() in search_haystack:
-                    size_mb = round((media.file_size or 0) / (1024 * 1024), 2)
-                    
-                    # Titre propre tiré de la légende ou du nom de fichier
-                    title = caption.split("\n")[0] if caption else file_name.rsplit(".", 1)[0].replace("_", " ")
-                    
-                    # Détection de la qualité
-                    quality = "1080p" if "1080" in search_haystack else ("720p" if "720" in search_haystack else "HD")
-                    
-                    episodes.append({
-                        "message_id": msg.id,
-                        "title": title,
-                        "file_name": file_name,
-                        "size_mb": size_mb,
-                        "download_url": f"/download/{clean}/{msg.id}",
-                        "quality": quality,
-                        "date_added": msg.date.strftime("%d/%m/%Y") if msg.date else "Récent"
-                    })
-                    
+                # Tente d'extraire le numéro d'épisode avec une Regex (ex: Ep 01, Episode 12, E05)
+                ep_match = re.search(r'(?:ep|episode|e)[\s._-]*(\d+)', file_name, re.IGNORECASE)
+                ep_number = int(ep_match.group(1)) if ep_match else None
+
+                episodes.append({
+                    "message_id": msg.id,
+                    "episode_number": ep_number,
+                    "title": msg.text if msg.text else file_name,
+                    "file_name": file_name,
+                    "size_mb": round(doc.size / (1024 * 1024), 2),
+                    "stream_url": f"/download/{channel}/{msg.id}"
+                })
+        
+        # Trie les épisodes par numéro d'épisode dans l'ordre croissant
+        episodes.sort(key=lambda x: x["episode_number"] if x["episode_number"] is not None else 9999)
+
         return {
-            "channel": clean,
             "query": q,
-            "total_found": len(episodes),
+            "anime_info": metadata,
+            "episodes_found": len(episodes),
             "episodes": episodes
         }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur Telegram ({type(e).__name__}): {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+# --- ROUTE DE TÉLÉCHARGEMENT & STREAMING ---
 @app.get("/download/{channel_id}/{message_id}")
-async def stream_media(channel_id: str, message_id: int, request: Request):
-    """
-    STREAMING VIDÉO FLUIDE :
-    Diffuse directement la vidéo depuis Telegram vers le lecteur vidéo sans attendre.
-    """
-    clean = channel_id.strip().lstrip("@")
-    target = int(clean) if (clean.startswith("-100") or clean.isdigit() or clean.startswith("-")) else clean
-
+async def download_file(channel_id: str, message_id: int):
     try:
-        msg = await user_bot.get_messages(target, message_id)
-        if not msg or not (msg.video or msg.document):
-            raise HTTPException(status_code=404, detail="Aucun fichier vidéo trouvé dans ce message")
+        target = int(channel_id) if channel_id.startswith("-") or channel_id.isdigit() else channel_id
+        message = await client.get_messages(target, ids=message_id)
+        
+        if not message or not message.media:
+            raise HTTPException(status_code=404, detail="Fichier introuvable.")
 
-        media = msg.video or msg.document
-        file_size = media.file_size or 0
-        file_name = getattr(media, "file_name", f"anime_{message_id}.mp4")
+        file_name = "anime.mp4"
+        file_size = 0
+        mime_type = "video/mp4"
 
-        # Streaming par morceaux (chunks) avec Pyrogram
-        async def video_streamer():
-            async for chunk in user_bot.stream_media(msg):
-                yield chunk
+        if isinstance(message.media, MessageMediaDocument):
+            doc = message.media.document
+            file_size = doc.size
+            mime_type = doc.mime_type
+            for attr in doc.attributes:
+                if hasattr(attr, 'file_name') and attr.file_name:
+                    file_name = attr.file_name
 
         headers = {
-            "Content-Disposition": f'inline; filename="{file_name}"',
-            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'attachment; filename="{file_name}"',
             "Content-Length": str(file_size),
-            "Content-Type": "video/mp4",
+            "Content-Type": mime_type,
+            "Accept-Ranges": "bytes"
         }
 
         return StreamingResponse(
-            video_streamer(),
+            iter_file_chunks(message),
             headers=headers,
-            media_type="video/mp4"
+            media_type=mime_type
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur de streaming: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
