@@ -162,9 +162,7 @@ async def download_file(channel_id: str, message_id: int, request: Request):
         headers = {
             "Content-Disposition": f'inline; filename="{safe_name}"',
             "Content-Length": str(content_length),
-            "Content-Type": mime_type,
             "Accept-Ranges": "bytes",
-            "Cache-Control": "no-cache",
         }
         if status_code == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
