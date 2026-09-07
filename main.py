@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -14,6 +15,48 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 app = FastAPI(title="NLSbox Pro Engine - FIXED")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+# --- ANTI-BAN: cache search results so identical queries don't hammer Telegram ---
+SEARCH_CACHE_TTL = 300  # 5 minutes
+SEARCH_FETCH_LIMIT = 500  # gather enough candidates for ranking to find exact matches
+RESULTS_PAGE_SIZE = 100
+_search_cache = {}  # {(channel, query): (data, timestamp)}
+
+
+def _get_cached_search(cache_key):
+    cached = _search_cache.get(cache_key)
+    if not cached:
+        return None
+    data, cached_at = cached
+    if time.time() - cached_at > SEARCH_CACHE_TTL:
+        _search_cache.pop(cache_key, None)
+        return None
+    return data
+
+
+def _set_cached_search(cache_key, data):
+    # Opportunistically drop expired entries so the cache doesn't grow forever.
+    now = time.time()
+    for key, (_, cached_at) in list(_search_cache.items()):
+        if now - cached_at > SEARCH_CACHE_TTL:
+            _search_cache.pop(key, None)
+    _search_cache[cache_key] = (data, now)
+
+
+def get_score(episode: dict, query: str) -> int:
+    """Rank a result: exact title match first, then prefix, then substring matches."""
+    q = query.lower().strip()
+    title = (episode.get("title") or "").lower().strip()
+    file_name = (episode.get("file_name") or "").lower().strip()
+    if title == q:
+        return 1000
+    if title.startswith(q):
+        return 900
+    if q in title:
+        return 700
+    if q in file_name:
+        return 600
+    return 0
 
 @app.on_event("startup")
 async def startup():
@@ -70,30 +113,61 @@ def home():
     return {"status": "En ligne FIXED - Range OK", "app": "NLSbox Backend Pro"}
 
 @app.get("/search")
-async def search_anime(q: str = Query(...), channel: str = Query(...)):
+async def search_anime(q: str = Query(...), channel: str = Query(...), page: int = Query(1, ge=1)):
     try:
         target = int(channel) if channel.startswith("-") or channel.isdigit() else channel
-        metadata = await fetch_anime_metadata(q)
-        episodes = []
-        async for msg in client.iter_messages(target, search=q, limit=100):
-            if msg.media and isinstance(msg.media, MessageMediaDocument):
-                file_name = "Episode.mp4"
-                doc = msg.media.document
-                for attr in doc.attributes:
-                    if hasattr(attr, 'file_name') and attr.file_name:
-                        file_name = attr.file_name
-                ep_match = re.search(r'(?:ep|episode|e)[\s._-]*(\d+)', file_name, re.IGNORECASE)
-                ep_number = int(ep_match.group(1)) if ep_match else None
-                episodes.append({
-                    "message_id": msg.id,
-                    "episode_number": ep_number,
-                    "title": msg.text if msg.text else file_name,
-                    "file_name": file_name,
-                    "size_mb": round(doc.size / (1024 * 1024), 2),
-                    "stream_url": f"/download/{channel}/{msg.id}"
-                })
-        episodes.sort(key=lambda x: x["episode_number"] if x["episode_number"] is not None else 9999)
-        return {"query": q, "anime_info": metadata, "episodes_found": len(episodes), "episodes": episodes}
+
+        cache_key = (str(channel), q.lower().strip())
+        cached = _get_cached_search(cache_key)
+        if cached:
+            metadata, episodes = cached["anime_info"], cached["episodes"]
+        else:
+            metadata = await fetch_anime_metadata(q)
+            episodes = []
+            async for msg in client.iter_messages(target, search=q, limit=SEARCH_FETCH_LIMIT):
+                if msg.media and isinstance(msg.media, MessageMediaDocument):
+                    doc = msg.media.document
+                    # Only drop genuinely broken entries (missing/empty file). Small
+                    # legit files (e.g. a short episode 1) must NOT be dropped.
+                    if not doc or not getattr(doc, "size", 0):
+                        continue
+                    file_name = "Episode.mp4"
+                    for attr in doc.attributes:
+                        if hasattr(attr, 'file_name') and attr.file_name:
+                            file_name = attr.file_name
+                    ep_match = re.search(r'(?:ep|episode|e)[\s._-]*(\d+)', file_name, re.IGNORECASE)
+                    ep_number = int(ep_match.group(1)) if ep_match else None
+                    episodes.append({
+                        "message_id": msg.id,
+                        "episode_number": ep_number,
+                        "title": msg.text if msg.text else file_name,
+                        "file_name": file_name,
+                        "size_mb": round(doc.size / (1024 * 1024), 2),
+                        "stream_url": f"/download/{channel}/{msg.id}"
+                    })
+            # RANKING FIX: exact/prefix/substring matches first, then episode number.
+            episodes.sort(key=lambda ep: (
+                -get_score(ep, q),
+                ep["episode_number"] if ep["episode_number"] is not None else 9999
+            ))
+            _set_cached_search(cache_key, {"anime_info": metadata, "episodes": episodes})
+
+        total_results = len(episodes)
+        total_pages = max(1, (total_results + RESULTS_PAGE_SIZE - 1) // RESULTS_PAGE_SIZE)
+        page = min(page, total_pages)
+        start = (page - 1) * RESULTS_PAGE_SIZE
+        page_episodes = episodes[start:start + RESULTS_PAGE_SIZE]
+
+        return {
+            "query": q,
+            "anime_info": metadata,
+            "episodes_found": total_results,
+            "page": page,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1,
+            "episodes": page_episodes
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
