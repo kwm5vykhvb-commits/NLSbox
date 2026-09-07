@@ -202,13 +202,22 @@ async def search_anime(q: str = Query(...), channel: str = Query(...), page: int
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- FIX CRITIQUE DU TELECHARGEMENT 0kb ---
+# NOTE: there is intentionally no global "current file" / single-entry cache here.
+# Every request must resolve its own Telegram message from the channel_id/message_id
+# given in the URL so concurrent requests for different files never collide.
 @app.get("/download/{channel_id}/{message_id}")
 async def download_file(channel_id: str, message_id: int, request: Request):
     try:
+        print(f"Streaming requested channel_id={channel_id} message_id={message_id}")
         target = int(channel_id) if channel_id.startswith("-") or channel_id.isdigit() else channel_id
+        # Always fetch the message for THIS request's message_id, never a cached/previous one.
         message = await client.get_messages(target, ids=message_id)
-        
+
         if not message or not message.media:
+            raise HTTPException(status_code=404, detail="Fichier introuvable.")
+
+        if message.id != message_id:
+            # Defensive guard: never stream a message other than the one requested.
             raise HTTPException(status_code=404, detail="Fichier introuvable.")
 
         file_name = "anime.mp4"
