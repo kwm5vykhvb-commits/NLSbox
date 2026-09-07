@@ -1,6 +1,7 @@
 import os
 import re
 import time
+from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -41,6 +42,36 @@ def _set_cached_search(cache_key, data):
         if now - cached_at > SEARCH_CACHE_TTL:
             _search_cache.pop(key, None)
     _search_cache[cache_key] = (data, now)
+
+
+# Episode-number extraction: tried in priority order to cover the many naming
+# conventions used by different release/fansub groups. A single "e/ep/episode"
+# regex misses very common formats like "Anime - 05 (1080p)[hash].mkv", where
+# the episode number appears as a plain token with no letter prefix at all.
+_EPISODE_NUMBER_PATTERNS = [
+    re.compile(r's(?:eason)?\s*\d{1,2}[\s._-]*(?:e(?:p(?:isode)?)?[\s._-]*)?(\d{1,4})', re.IGNORECASE),  # S01E05, Season 1 Episode 05, Season 3 - 05
+    re.compile(r'(?<![A-Za-z0-9])(?:episode|ep)[\s._-]*(\d{1,4})(?:v\d+)?(?![A-Za-z0-9])', re.IGNORECASE),  # Episode 05, Ep.05, Ep_05
+    re.compile(r'(?<![A-Za-z0-9])e[\s._-]*(\d{1,4})(?:v\d+)?(?![A-Za-z0-9])', re.IGNORECASE),  # E05
+    re.compile(r'(?:^|[\[\(\s._-])(\d{1,4})(?:v\d+)?(?:[\]\)\s._-]|$)'),  # standalone "- 05 -", "[05]", "(05)"
+]
+
+
+def extract_episode_number(file_name: str) -> Optional[int]:
+    """Best-effort episode number extraction from a release file name.
+
+    Tries, in order: "S01E05"/"Season 1 Episode 05", explicit "Episode"/"Ep"
+    keywords, a lone "E05" marker, then falls back to a plain number isolated
+    between separators/brackets (e.g. "Title - 05 (1080p).mkv") which many
+    fansub groups use without any letter prefix.
+    """
+    for pattern in _EPISODE_NUMBER_PATTERNS:
+        match = pattern.search(file_name)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def get_score(episode: dict, query: str) -> int:
@@ -135,8 +166,7 @@ async def search_anime(q: str = Query(...), channel: str = Query(...), page: int
                     for attr in doc.attributes:
                         if hasattr(attr, 'file_name') and attr.file_name:
                             file_name = attr.file_name
-                    ep_match = re.search(r'(?:ep|episode|e)[\s._-]*(\d+)', file_name, re.IGNORECASE)
-                    ep_number = int(ep_match.group(1)) if ep_match else None
+                    ep_number = extract_episode_number(file_name)
                     episodes.append({
                         "message_id": msg.id,
                         "episode_number": ep_number,
