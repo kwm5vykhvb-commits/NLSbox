@@ -1,2 +1,2 @@
-# Requirements file for Render deployment compatibility
-# This project is powered by Node.js & TypeScript
+uvicorn>=0.20.0
+httpx>=0.24.0
