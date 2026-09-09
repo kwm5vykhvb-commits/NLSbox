@@ -1,0 +1,8 @@
+{
+  "name": "NLSbox Pro Engine",
+  "description": "Moteur de streaming et recherche d'animes connecté directement à Telegram MTProto avec support des requêtes HTTP Range 206 et dépollution des métadonnées",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
