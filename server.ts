@@ -24,39 +24,77 @@ app.use(cors());
 app.use(express.json());
 
 // --- TELEGRAM CLIENT SINGLETON (GramJS MTProto) ---
+// Règle d'or : une seule et unique instance TelegramClient dans tout le cycle de vie du processus
 let tgClient: TelegramClient | null = null;
 let tgConnectingPromise: Promise<TelegramClient | null> | null = null;
 
-export async function getTelegramClient(): Promise<TelegramClient | null> {
-  if (tgClient && tgClient.connected) {
-    return tgClient;
+export function getOrCreateClientInstance(): TelegramClient | null {
+  if (tgClient) return tgClient;
+
+  const apiId = parseInt(process.env.API_ID || "0", 10);
+  const apiHash = (process.env.API_HASH || "").trim();
+  const sessionStr = (process.env.SESSION_STRING || "").trim();
+
+  if (!apiId || !apiHash || !sessionStr) {
+    console.warn("[Telegram Singleton] Identifiants Telegram manquants dans l'environnement (API_ID, API_HASH, SESSION_STRING)");
+    return null;
   }
+
+  try {
+    const session = new StringSession(sessionStr);
+    tgClient = new TelegramClient(session, apiId, apiHash, {
+      connectionRetries: 3,
+      useWSS: false,
+      autoReconnect: false,
+      timeout: 10,
+      retryDelay: 1000,
+      deviceModel: "NLSbox Engine Pro",
+      systemVersion: "Linux",
+      appVersion: "1.0.0",
+    });
+    return tgClient;
+  } catch (err: any) {
+    console.error("[Telegram Singleton] Erreur lors de l'initialisation de TelegramClient:", err?.message || err);
+    return null;
+  }
+}
+
+export async function getTelegramClient(): Promise<TelegramClient | null> {
+  const client = getOrCreateClientInstance();
+  if (!client) {
+    return null;
+  }
+
+  // Si le client est déjà connecté, le retourner immédiatement (aucun appel réseau)
+  if (client.connected) {
+    return client;
+  }
+
+  // Mutex : si une connexion est déjà en cours par une autre requête, attendre celle-ci
   if (tgConnectingPromise) {
     return tgConnectingPromise;
   }
 
-  const apiId = parseInt(process.env.API_ID || "0", 10);
-  const apiHash = process.env.API_HASH || "";
-  const sessionStr = process.env.SESSION_STRING || "";
-
-  if (!apiId || !apiHash || !sessionStr) {
-    console.warn("Telegram credentials not found in env (API_ID, API_HASH, SESSION_STRING)");
-    return null;
-  }
-
   tgConnectingPromise = (async () => {
     try {
-      const session = new StringSession(sessionStr);
-      const client = new TelegramClient(session, apiId, apiHash, {
-        connectionRetries: 5,
-        useWSS: false,
-      });
-      await client.connect();
-      tgClient = client;
-      console.log("Connected to Telegram MTProto successfully");
+      console.log("[Telegram Singleton] Connexion au serveur MTProto en cours...");
+      const connectPromise = client.connect();
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Délai de connexion Telegram MTProto dépassé (timeout 10s)")), 10000)
+      );
+      await Promise.race([connectPromise, timeoutPromise]);
+      console.log("[Telegram Singleton] Connecté avec succès à Telegram MTProto !");
       return client;
     } catch (err: any) {
-      console.error("Failed to connect to Telegram MTProto:", err?.message || err);
+      console.error("[Telegram Singleton] Échec de connexion:", err?.message || err);
+      if (err?.message?.includes("AUTH_KEY_DUPLICATED")) {
+        console.error("⚠️ [Telegram CRITICAL] AUTH_KEY_DUPLICATED : Conflit de session MTProto ! Une autre instance ou worker utilise la même clé de session.");
+        // Réinitialiser le client pour permettre une nouvelle tentative propre
+        try {
+          await client.disconnect();
+        } catch (_) {}
+        tgClient = null;
+      }
       return null;
     } finally {
       tgConnectingPromise = null;
@@ -1081,12 +1119,18 @@ app.get("/search", async (req: Request, res: Response) => {
           isRealTelegram = true;
           console.log(`[Telegram Search] Found ${rawItems.length} media messages in channel "${channel}"`);
         } catch (err: any) {
-          console.warn(`[Telegram Search] Failed to search channel ${channel}:`, err.message);
-          return res.status(404).json({
-            detail: `Impossible d'accéder au canal "${channel}": ${err.message}.`,
+          console.warn(`[Telegram Search] Failed to search channel ${channel}:`, err?.message || err);
+          const isAuthDup = err?.message?.includes("AUTH_KEY_DUPLICATED");
+          const errStatus = isAuthDup ? 409 : 404;
+          return res.status(errStatus).json({
+            detail: isAuthDup
+              ? "Conflit de session Telegram MTProto (406: AUTH_KEY_DUPLICATED) : session utilisée en concurrence ou invalidée."
+              : `Impossible d'accéder au canal "${channel}": ${err?.message || err}.`,
+            error: isAuthDup ? "AuthKeyDuplicated" : "ChannelNotFound",
+            status_code: errStatus,
             anime_info: {
               title: q || "Contenu Telegram",
-              synopsis: "Erreur d'accès au canal",
+              synopsis: isAuthDup ? "Conflit de session MTProto Telegram" : "Erreur d'accès au canal",
               cover: null,
               score: null,
               genres: [],
@@ -1204,10 +1248,18 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
   const msgIdNum = parseInt(message_id, 10);
   const isDownload = req.query.dl === "1";
 
-  const client = await getTelegramClient();
+  // Si c'est un canal Telegram réel demandé
+  if (channel_id && channel_id !== "demo" && channel_id !== "-1001234567890" && !isNaN(msgIdNum)) {
+    const client = await getTelegramClient();
 
-  // Si canal et message Telegram réels
-  if (client && channel_id && channel_id !== "-1001234567890" && !isNaN(msgIdNum)) {
+    if (!client) {
+      return res.status(503).json({
+        detail: "Service Telegram indisponible : client non connecté ou identifiants MTProto manquants.",
+        error: "TelegramClientUnavailable",
+        status_code: 503,
+      });
+    }
+
     try {
       const entity = await client.getEntity(channel_id);
       const [msg] = await client.getMessages(entity, { ids: [msgIdNum] });
@@ -1215,7 +1267,11 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
       const doc = msg?.media && ("document" in msg.media ? (msg.media as any).document : "video" in msg.media ? (msg.media as any).video : null);
 
       if (!msg || !doc) {
-        return res.status(404).send("Média ou message Telegram introuvable dans ce canal.");
+        return res.status(404).json({
+          detail: `Média ou message Telegram #${message_id} introuvable dans le canal "${channel_id}".`,
+          error: "MediaNotFound",
+          status_code: 404,
+        });
       }
 
       const totalSize = Number(doc.size || 0);
@@ -1237,7 +1293,6 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
       }
 
       // Nettoyer strictement les caractères interdits pour les systèmes d'exploitation (Windows, Mac, Linux, Android)
-      // Caractères interdits : \ / : * ? " < > |
       const sanitizedName = fileName
         .replace(/[/\\?%*:|"<>]/g, "_")
         .replace(/\s+/g, " ")
@@ -1271,7 +1326,8 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
       res.setHeader("X-Content-Type-Options", "nosniff");
 
       const rangeHeader = req.headers.range;
-      const requestSize = 512 * 1024; // 512KB Telegram chunk optimal
+      const CHUNK_SIZE = 512 * 1024; // 512 Ko par fragment Telegram (optimal MTProto)
+      const MIN_ALIGNMENT = 4096; // MTProto requiert un offset multiple de 4096 octets
 
       if (rangeHeader) {
         let start = 0;
@@ -1282,7 +1338,7 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
         const partEnd = parts[1];
 
         if (partStart === "" && partEnd !== "") {
-          // Suffix byte range: e.g. bytes=-500000 (derniers 500KB pour lire le box MOOV en fin de fichier MP4)
+          // Suffix byte range: e.g. bytes=-500000 (derniers 500KB pour lire le box MOOV en fin de MP4)
           const suffixLength = parseInt(partEnd, 10);
           start = Math.max(0, totalSize - suffixLength);
           end = totalSize - 1;
@@ -1293,7 +1349,11 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
 
         if (isNaN(start) || isNaN(end) || start >= totalSize || start > end) {
           res.setHeader("Content-Range", `bytes */${totalSize}`);
-          return res.status(416).send("Range Not Satisfiable");
+          return res.status(416).json({
+            detail: "Plage d'octets demandée non satisfaisante (Range Not Satisfiable).",
+            error: "RangeNotSatisfiable",
+            status_code: 416,
+          });
         }
 
         const chunkLength = end - start + 1;
@@ -1306,13 +1366,16 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
           return res.end();
         }
 
-        const numChunks = Math.ceil(chunkLength / requestSize) + 1;
+        // Alignement strict requis par Telegram MTProto upload.GetFile
+        const alignedStart = Math.floor(start / MIN_ALIGNMENT) * MIN_ALIGNMENT;
+        let skipInitialBytes = start - alignedStart;
+        const numChunks = Math.ceil((chunkLength + skipInitialBytes) / CHUNK_SIZE) + 1;
 
         const iter = client.iterDownload({
           file: msg.media,
-          offset: bigInt(start),
+          offset: bigInt(alignedStart),
           limit: numChunks,
-          requestSize: requestSize,
+          requestSize: CHUNK_SIZE,
         });
 
         let bytesSent = 0;
@@ -1321,13 +1384,25 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
           closed = true;
         });
 
-        for await (const chunk of iter) {
+        for await (const rawChunk of iter) {
           if (closed) break;
+          let chunk = rawChunk;
+
+          if (skipInitialBytes > 0) {
+            if (chunk.length <= skipInitialBytes) {
+              skipInitialBytes -= chunk.length;
+              continue;
+            }
+            chunk = chunk.subarray(skipInitialBytes);
+            skipInitialBytes = 0;
+          }
+
           const remaining = chunkLength - bytesSent;
           if (remaining <= 0) break;
           const toWrite = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
           const canContinue = res.write(toWrite);
           bytesSent += toWrite.length;
+
           if (bytesSent >= chunkLength) break;
           if (!canContinue && !closed) {
             await new Promise((resolve) => res.once("drain", resolve));
@@ -1335,7 +1410,7 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
         }
         return res.end();
       } else {
-        // Direct download complet ou streaming sans en-tête Range
+        // Téléchargement direct complet ou streaming sans en-tête Range
         res.status(200);
         res.setHeader("Content-Length", totalSize.toString());
         res.setHeader("Content-Type", mimeType);
@@ -1344,13 +1419,12 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
           return res.end();
         }
 
-        const numChunks = Math.ceil(totalSize / requestSize) + 1;
-
+        const numChunks = Math.ceil(totalSize / CHUNK_SIZE) + 1;
         const iter = client.iterDownload({
           file: msg.media,
           offset: bigInt(0),
           limit: numChunks,
-          requestSize: requestSize,
+          requestSize: CHUNK_SIZE,
         });
 
         let bytesSent = 0;
@@ -1366,6 +1440,7 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
           const toWrite = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
           const canContinue = res.write(toWrite);
           bytesSent += toWrite.length;
+
           if (bytesSent >= totalSize) break;
           if (!canContinue && !closed) {
             await new Promise((resolve) => res.once("drain", resolve));
@@ -1374,9 +1449,17 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
         return res.end();
       }
     } catch (err: any) {
-      console.error(`Download/Stream error for channel ${channel_id} msg ${message_id}:`, err?.message || err);
+      console.error(`[Download/Stream Error] canal ${channel_id} msg ${message_id}:`, err?.message || err);
       if (!res.headersSent) {
-        return res.status(500).send(`Erreur lors du streaming ou téléchargement Telegram: ${err.message || err}`);
+        const isAuthDup = err?.message?.includes("AUTH_KEY_DUPLICATED");
+        const statusCode = isAuthDup ? 409 : 500;
+        return res.status(statusCode).json({
+          detail: isAuthDup
+            ? "Conflit de session Telegram MTProto (406: AUTH_KEY_DUPLICATED) : session utilisée en concurrence ou invalidée."
+            : `Erreur lors du streaming ou téléchargement Telegram: ${err?.message || err}`,
+          error: isAuthDup ? "AuthKeyDuplicated" : "TelegramStreamError",
+          status_code: statusCode,
+        });
       }
       return res.end();
     }
@@ -1407,21 +1490,59 @@ app.get(["/download/:channel_id/:message_id", "/download/:channel_id/:message_id
   res.send(sampleVideoData.subarray(start, end + 1));
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
+// Global 404 Handler (ne jamais renvoyer de HTML 404)
+app.use((req: Request, res: Response) => {
+  if (!res.headersSent) {
+    res.status(404).json({
+      detail: `Route introuvable : ${req.method} ${req.path}`,
+      error: "NotFound",
+      status_code: 404,
+    });
+  }
+});
+
+// Global Error Handler (ne jamais renvoyer de page HTML 500)
+app.use((err: any, req: Request, res: Response, _next: any) => {
+  console.error("[Unhandled Error]", err);
+  if (!res.headersSent) {
+    res.status(500).json({
+      detail: err?.message || "Erreur interne du serveur",
+      error: err?.name || "InternalServerError",
+      status_code: 500,
+    });
+  }
+});
+
+const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`NLSbox Pro Engine running at http://0.0.0.0:${PORT} (env: ${process.env.NODE_ENV || "development"})`);
+
+  // Warmup Singleton Telegram au démarrage du serveur
+  try {
+    const client = await getTelegramClient();
+    if (client && client.connected) {
+      console.log("[Telegram MTProto] Singleton client réchauffé et opérationnel au démarrage.");
+    }
+  } catch (err: any) {
+    console.warn("[Telegram MTProto] Tentative de connexion au démarrage différée :", err?.message || err);
+  }
 });
 
 // Arrêt propre (Graceful Shutdown) pour les déploiements Render
-process.on("SIGTERM", () => {
-  console.log("SIGTERM reçu : fermeture progressive du serveur HTTP...");
-  server.close(() => {
-    console.log("Serveur HTTP fermé proprement.");
+const handleShutdown = async (signal: string) => {
+  console.log(`[NLSbox] ${signal} reçu : fermeture progressive du serveur HTTP et de la session Telegram...`);
+  server.close(async () => {
+    if (tgClient && tgClient.connected) {
+      try {
+        console.log("[Telegram MTProto] Déconnexion propre de la session Singleton Telegram...");
+        await tgClient.disconnect();
+      } catch (e) {
+        // Ignorer les erreurs à l'arrêt
+      }
+    }
+    console.log("[NLSbox] Serveur HTTP et session Telegram fermés proprement.");
     process.exit(0);
   });
-});
+};
 
-process.on("SIGINT", () => {
-  server.close(() => {
-    process.exit(0);
-  });
-});
+process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+process.on("SIGINT", () => handleShutdown("SIGINT"));

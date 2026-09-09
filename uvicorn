@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Wrapper pour exécuter uvicorn même s'il n'est pas dans le PATH global
+# Strictement 1 worker pour éviter toute concurrence sur la session Telegram MTProto
+export WEB_CONCURRENCY=1
+export UVICORN_WORKERS=1
+
 if command -v python3 >/dev/null 2>&1; then
   exec python3 -m uvicorn "$@"
 elif command -v python >/dev/null 2>&1; then

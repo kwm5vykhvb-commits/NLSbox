@@ -7,8 +7,20 @@ import sys
 import time
 import urllib.request
 
+# Strictement 1 worker pour éviter les conflits MTProto Telegram (AUTH_KEY_DUPLICATED)
+os.environ["WEB_CONCURRENCY"] = "1"
+os.environ["UVICORN_WORKERS"] = "1"
+
 INTERNAL_NODE_PORT = int(os.environ.get("INTERNAL_NODE_PORT", "3001"))
 node_process = None
+
+def is_node_ready():
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{INTERNAL_NODE_PORT}/healthz")
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 def ensure_build():
     """S'assure que les dépendances et le serveur TypeScript sont compilés."""
@@ -22,6 +34,8 @@ def ensure_build():
 
 def start_node_server():
     global node_process
+    if is_node_ready():
+        return
     if node_process and node_process.poll() is None:
         return
 
@@ -30,6 +44,7 @@ def start_node_server():
     env = os.environ.copy()
     env["PORT"] = str(INTERNAL_NODE_PORT)
     env["NODE_ENV"] = env.get("NODE_ENV", "production")
+    env["WEB_CONCURRENCY"] = "1"
 
     print(f"[NLSbox-Bridge] Lancement du moteur Node.js sur le port interne {INTERNAL_NODE_PORT}...")
     node_process = subprocess.Popen(
@@ -45,14 +60,10 @@ def start_node_server():
         if node_process.poll() is not None:
             print("[NLSbox-Bridge] Erreur : le processus Node.js s'est arrêté inopinément.")
             break
-        try:
-            req = urllib.request.Request(f"http://127.0.0.1:{INTERNAL_NODE_PORT}/healthz")
-            with urllib.request.urlopen(req, timeout=1) as resp:
-                if resp.status == 200:
-                    print(f"[NLSbox-Bridge] Node.js opérationnel sur le port {INTERNAL_NODE_PORT} !")
-                    return
-        except Exception:
-            time.sleep(0.3)
+        if is_node_ready():
+            print(f"[NLSbox-Bridge] Node.js opérationnel sur le port {INTERNAL_NODE_PORT} !")
+            return
+        time.sleep(0.3)
 
 def stop_node_server():
     global node_process
@@ -158,8 +169,16 @@ async def proxy_with_raw_socket(scope, receive, send):
             header_data += chunk
 
         if not header_data:
-            await send({"type": "http.response.start", "status": 502, "headers": []})
-            await send({"type": "http.response.body", "body": b"Bad Gateway", "more_body": False})
+            err_body = b'{"detail": "Passerelle interne Node.js inaccessible.", "error": "BadGateway", "status_code": 502}'
+            await send({
+                "type": "http.response.start",
+                "status": 502,
+                "headers": [
+                    [b"content-type", b"application/json"],
+                    [b"content-length", str(len(err_body)).encode("latin1")],
+                ],
+            })
+            await send({"type": "http.response.body", "body": err_body, "more_body": False})
             return
 
         headers_part, first_body_part = header_data.split(b"\r\n\r\n", 1)
